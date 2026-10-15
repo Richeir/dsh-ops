@@ -262,7 +262,8 @@ await test('ladder --json has a stable shape and lists exactly the rungs the ren
     assert.deepEqual(Object.keys(parsed.fastctx), ['resolved', 'executable', 'source', 'error', 'tried'])
     assert.deepEqual(Object.keys(parsed.shells), ['bash', 'pwsh'])
     for (const kind of ['bash', 'pwsh']) {
-      assert.deepEqual(Object.keys(parsed.shells[kind]), ['available', 'executable', 'source', 'detail'])
+      assert.deepEqual(Object.keys(parsed.shells[kind]),
+        ['available', 'executable', 'source', 'detail', ...(kind === 'bash' ? ['restricted'] : [])])
       assert.equal(
         parsed.shells[kind].executable === null,
         parsed.shells[kind].available === false,
@@ -279,11 +280,18 @@ await test('ladder --json has a stable shape and lists exactly the rungs the ren
     assert.equal(parsed.levels.fastctx, true)
     assert.equal(parsed.shells.bash.available, true, `the configured bash resolved: ${parsed.shells.bash.detail}`)
     assert.equal(parsed.levels.bash, true)
+    // A configured bash without the pinned MSYS beside it cannot run in restricted modes (#42).
+    if (process.platform === 'win32') {
+      assert.equal(parsed.shells.bash.restricted.compatible, false)
+      assert.match(parsed.shells.bash.restricted.reason, /msys-2\.0\.dll/u)
+    }
     assertLadder(parsed)
 
     // Both output modes describe one report: the human one prints the same rungs.
     const human = runCli({ home, user, args: args.slice(1), command: 'ladder' })
     assert.equal(human.status, 0, human.stderr)
+    assert.equal(human.stdout.includes('requires full-access session'), false, 'the stale full-access-only claim is gone')
+    assert.match(human.stdout, /custom bashPath works only in full access/u)
     assert.deepEqual(printedRungs(human.stdout), parsed.rungs)
     assert.ok(human.stdout.includes(runtime), 'the report names the executable')
     assert.equal(human.stdout.includes('MCP handshake'), false, 'ladder never handshakes')
@@ -326,12 +334,14 @@ await test('a shell the deployment does not have is reported as missing, with th
 
     const resolved = resolveShells(resolveConfig(config), { env })
     for (const kind of ['bash', 'pwsh']) {
-      assert.deepEqual(parsed.shells[kind], {
+      const { restricted, ...rung } = parsed.shells[kind]
+      assert.deepEqual(rung, {
         available: resolved[kind].available,
         executable: resolved[kind].file ?? null,
         source: resolved[kind].source,
         detail: resolved[kind].detail,
       }, `the report and the resolver disagree about ${kind}`)
+      if (kind === 'bash') assert.equal(restricted === null, !resolved.bash.available, 'restricted is reported exactly for a resolved bash')
       if (resolved[kind].source === 'missing') {
         assert.equal(parsed.shells[kind].executable, null)
         assert.match(human.stdout, /executable: missing/u)

@@ -64,6 +64,8 @@ npx --yes dsh-ops@latest install --profile desktop
 
 > **不要**用 `allowSystemShellFallback: true` 绕过：那是安全姿态降级（改用未固定摘要的系统 bash），且首次升级启动的配置迁移会把它改回 `false`。
 
+> **`bashPath` 仅在 `danger-full-access` 下生效**：只读/工作区内修改模式只运行固定摘要的随包或 provision 的 bash，自带 Git for Windows 会按设计返回 `EXECUTOR_UNAVAILABLE`，不要靠它绕过受限模式问题。见 [配置参考](docs/配置参考.md)。
+
 > 普通 DSH CLI 不能管理保留的 `desktop` profile；不要把它与桌面自带入口混淆。
 
 详情与兜底办法见 [常见问题](docs/常见问题.md)。

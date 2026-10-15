@@ -40,6 +40,7 @@ import {
   renderToolingPolicy,
 } from '../lib/policy.js'
 import { VENDOR_DIR, buildFreshness, builtBinary, cargoBuild, findCargo } from '../lib/rust.js'
+import { restrictedCompatibility } from '../lib/bash-ipc.js'
 import {
   PLATFORM_PACKAGES,
   SHELL_UPSTREAM_PINS,
@@ -260,6 +261,22 @@ function shellReport(resolution) {
 }
 
 /**
+ * Whether read-only / workspace-write sessions can run the resolved bash: they
+ * accept only the pinned MSYS the IPC proxies were verified against (#42).
+ * @param {import('../lib/shells.js').ShellResolution} resolution - the bash rung.
+ * @returns {{compatible: boolean, reason: string}|null} null when there is no bash to check.
+ */
+function restrictedReport(resolution) {
+  if (resolution.available !== true || typeof resolution.file !== 'string') return null
+  try {
+    const { compatible, reason } = restrictedCompatibility(resolution.file)
+    return { compatible, reason }
+  } catch (error) {
+    return { compatible: false, reason: String(error?.message ?? error) }
+  }
+}
+
+/**
  * The rungs this deployment can reach, from the same derivation the plugin's
  * prompt uses.
  *
@@ -322,12 +339,16 @@ function printLadder(report) {
     console.log(`    executable: ${rung.executable ?? 'missing'}`)
     console.log(`    source:     ${rung.source}`)
     console.log(`    detail:     ${rung.detail}`)
+    if (rung.restricted) {
+      console.log(`    restricted: ${rung.restricted.compatible ? 'yes' : 'no'} (${rung.restricted.reason})`)
+    }
   }
 
   console.log('\nThree layers: repository tools → bash → PowerShell 7')
   console.log(report.policy || '(no file tools resolved)')
   console.log('\nResolution only: command visibility requires a live host session and sandboxPolicy.')
-  console.log('Resolved candidates only; bash also requires full-access session and subprocess. Nothing is spawned.')
+  console.log('Resolved candidates only; bash also needs the host subprocess service. Full access runs the executable directly;')
+  console.log('read-only / workspace-write additionally require the pinned MSYS (see "restricted"), so a custom bashPath works only in full access. Nothing is spawned.')
 }
 
 /**
@@ -357,7 +378,7 @@ function commandLadder({ json, configFile }) {
   const levels = ladderFor({ runtime, shells, config })
   const report = {
     fastctx: runtime,
-    shells: { bash: shellReport(shells.bash), pwsh: shellReport(shells.pwsh) },
+    shells: { bash: { ...shellReport(shells.bash), restricted: restrictedReport(shells.bash) }, pwsh: shellReport(shells.pwsh) },
     levels,
     rungs: [],
     policy: renderToolingPolicy({

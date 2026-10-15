@@ -51,7 +51,7 @@ config:
   publishBashTool: true
   shellPolicy: advise
   allowSystemShellFallback: false
-  # bashPath: 'C:\tools\bash.exe'
+  # bashPath: 'C:\tools\bash.exe'   # honoured in danger-full-access only; see bashPath below
 ```
 
 The `dsh-ops/background` row (its market row is disabled by default):
@@ -80,6 +80,7 @@ config:
 - `allowSystemShellFallback`: defaults to `false`. Without a bundled/provisioned bash, do not discover system PATH or well-known installations; background commands cannot bypass this through FastCtx discovery either. Explicit `true` opts into an unpinned system bash that the operator must trust and maintain. Explicit `bashPath` is a separate operator selection, not an automatic fallback. See the update configuration modification area in the [usage guide](usage.md) for the first-start migration.
 - `shellPolicy` is independent: `deny-host-shell` masks/refuses host tools; disabling fallback constrains the plugin's bash resolver, not the host's own `pwsh`, and is not a filesystem sandbox.
 - `binaryPath` / `bashPath`: optional explicit paths; unavailable paths cause an error rather than silently switching executors. Usually no configuration is needed.
+- `bashPath` **works only in `danger-full-access`.** In read-only and workspace-write, `ops_bash` runs only the pinned MSYS whose IPC compatibility proxies were verified (the bundled payload or `dsh-ops provision-shells --bash`); any other `msys-2.0.dll`, including your own Git for Windows, returns `EXECUTOR_UNAVAILABLE` by design and is never run unconfined. Do not point `bashPath` at your own Git Bash to work around a restricted-mode problem. Check a selection with `dsh-ops ladder --config <file>`, which reports `restricted: yes/no` for the resolved bash. See [Troubleshooting](troubleshooting.md#ops_bash-cannot-run-a-custom-bashpath-or-git-for-windows-in-restricted-modes).
 - `deniedHostTools`: the host tool names refused by the `deny-host-shell` policy.
 - `serverName`: the legacy FastCtx server identity, kept for existing deployment rows; server instructions are no longer published as a separate prompt section.
 - `configUpdateVersion`: completion marker for the one-time configuration migration. Do not remove it, or the self-check runs again.

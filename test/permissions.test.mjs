@@ -5,7 +5,7 @@ import Sandbox from '@deepseek-ai/dsh-sandbox-local'
 import Subprocess from '@deepseek-ai/dsh-subprocess-local'
 import { assert, test, report, withTempDir } from './lib/harness.mjs'
 import { bootHost, shutdown } from './lib/host.mjs'
-import { prepareWorkspace, mountWorkspacePreparation } from '../lib/workspace-preparation.js'
+import { prepareWorkspace, mountWorkspacePreparation, runPreparation } from '../lib/workspace-preparation.js'
 import { invoke as fileCall } from '../lib/file/worker.js'
 import { invoke as ptcCall } from '../lib/ptc/worker.js'
 import { resolveWorker } from '../lib/ptc/runtime.js'
@@ -14,12 +14,46 @@ import { resolveShells } from '../lib/shells.js'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import NodePtc from '@deepseek-ai/dsh-ptc-runtime-node'
 import FileSystem from '@deepseek-ai/dsh-fs-local'
+import * as ObservationPolicy from '@deepseek-ai/dsh-fs-observation-policy'
 const worker = resolveWorker()
 function ps(code) {
   const result = spawnSync('powershell.exe', ['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(code,'utf16le').toString('base64')], { encoding:'utf8' })
   assert.equal(result.status,0,result.stderr)
   return result.stdout.trim()
 }
+await test('the real worker behaves as the file-tool descriptions say (#44)', async () => {
+  await withTempDir('file-contract',async root => {
+    fs.mkdirSync(path.join(root,'sub'),{recursive:true}); fs.mkdirSync(path.join(root,'vendor'),{recursive:true})
+    fs.writeFileSync(path.join(root,'top.md'),'needle\n'); fs.writeFileSync(path.join(root,'sub','nested.md'),'needle\n')
+    fs.writeFileSync(path.join(root,'vendor','v.md'),'needle\n'); fs.writeFileSync(path.join(root,'a.txt'),'a.b axb\n')
+    const {ctx}=await bootHost()
+    const agent={id:'contract',session:{id:'contract',header:{cwd:root}}}
+    const exec={agent,signal:new AbortController().signal}
+    try {
+      await ctx.plugin(Subprocess)
+      await ctx.plugin(inner=>inner.provide('sandboxPolicy',{defaultMode:'danger-full-access',resolve:()=>({mode:'danger-full-access',workspaceRoot:root})}))
+      const call=(tool,args)=>fileCall(ctx,worker,tool,args,exec,exec.signal)
+      const names=value=>value.items.map(item=>path.relative(root,typeof item==='string'?item:item.path).replaceAll('\\','/')).sort()
+      // Wrong shapes resolve as structured errors; nothing is thrown.
+      const bare=await call('glob',{pattern:'*.md'})
+      assert.equal(bare.status,'error',JSON.stringify(bare)); assert.equal(typeof bare.error.code,'string')
+      const include=await call('grep',{pattern:'needle',include:'*.md'})
+      assert.equal(include.status,'error',JSON.stringify(include)); assert.match(include.error.message,/include/)
+      // "*.md" is top level only; "**/*.md" with "!" exclusions reaches nested files.
+      assert.deepEqual(names(await call('glob',{pattern:['*.md']})),['top.md'])
+      assert.deepEqual(names(await call('glob',{pattern:['**/*.md','!vendor/**']})),['sub/nested.md','top.md'])
+      const negativeOnly=await call('glob',{pattern:['!vendor/**']})
+      assert.equal(negativeOnly.status,'error',JSON.stringify(negativeOnly))
+      // The grep/replace glob filter accepts exclude-only lists: everything except.
+      const grep=await call('grep',{pattern:'needle',glob:['!vendor/**'],outputMode:'files_with_matches'})
+      assert.deepEqual(names(grep),['sub/nested.md','top.md'])
+      // replace matches literal text: "a.b" does not match "axb".
+      const replaced=await call('replace',{path:'a.txt',pattern:'a.b',replacement:'Z'})
+      assert.equal(replaced.changed,1,JSON.stringify(replaced))
+      assert.equal(fs.readFileSync(path.join(root,'a.txt'),'utf8'),'Z axb\n')
+    } finally { await shutdown(ctx) }
+  })
+})
 await test('preparation never runs in read-only or full-access', async () => {
   let calls = 0
   for (const mode of ['read-only','danger-full-access']) await prepareWorkspace({mode,workspaceRoot:'invalid'}, {platform:'win32',run(){ calls++ }})
@@ -32,6 +66,79 @@ await test('preparation coalesces one trusted workspace and retries only failed 
     const options={platform:'win32',run(){calls++;return Promise.resolve()}}
     await Promise.all([prepareWorkspace(policy,options),prepareWorkspace(policy,options)])
     assert.equal(calls,1)
+  })
+})
+await test('preparation failures always say why, including a timeout (#43)', async () => {
+  const node=code=>({executable:process.execPath,args:['-e',code]})
+  const failure=async options=>{ try { await runPreparation('C:\\ws',options); return '' } catch(error) { return error.message } }
+  const timeout=await failure({...node('setTimeout(()=>{},60000)'),timeoutMs:200})
+  assert.match(timeout,/timed out after 200 ms preparing C:\\ws; the workspace ACL state is unknown/)
+  assert.match(timeout,/acl-backups/)
+  assert.notEqual(timeout.split('): ')[1]?.trim() ?? '','')
+  assert.match(await failure(node('process.exit(3)')),/exited with code 3 after \d+ ms preparing C:\\ws: \(no output\)$/)
+  assert.match(await failure(node('process.stderr.write("Get-Acl failed\\n");process.exit(1)')),/exited with code 1 .*: Get-Acl failed$/)
+  assert.match(await failure(node('process.stdout.write("half done");process.exit(1)')),/: half done$/)
+  assert.match(await failure({executable:path.join(process.cwd(),'missing-powershell.exe'),args:[]}),/could not start .*missing-powershell\.exe/)
+  await runPreparation('C:\\ws',node('process.stdout.write("prepared")'))
+})
+await test('real preparation writes only the root DACL, never descendants (#43)', async () => {
+  if(process.platform!=='win32')return
+  await withTempDir('prepare-root-only',async root => {
+    for(let d=0;d<10;d++) { const dir=path.join(root,`d${d}`,'deep'); fs.mkdirSync(dir,{recursive:true}); for(let f=0;f<30;f++) fs.writeFileSync(path.join(dir,`f${f}.txt`),'x') }
+    const quoted=root.replaceAll("'","''")
+    ps(`$p='${quoted}'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User; $a=[Security.AccessControl.DirectorySecurity]::new(); $a.SetOwner($sid); $a.SetAccessRuleProtection($true,$false); $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'Modify','ContainerInherit,ObjectInherit','None','Allow')); Set-Acl -LiteralPath $p -AclObject $a`)
+    const sddl=target=>ps(`(Get-Acl -LiteralPath '${target.replaceAll("'","''")}').GetSecurityDescriptorSddlForm('Access')`)
+    const deep=path.join(root,'d9','deep','f29.txt'), deepDir=path.join(root,'d9','deep')
+    const before={root:sddl(root),deep:sddl(deep),deepDir:sddl(deepDir)}
+    const backups=path.join(process.env.DSH_HOME,'dsh-ops','acl-backups')
+    const receipts=()=>fs.existsSync(backups) ? fs.readdirSync(backups).length : 0
+    const initial=receipts()
+    await runPreparation(root)
+    const after=sddl(root)
+    assert.ok(after.startsWith(before.root.slice(0,before.root.indexOf('('))),`DACL control flags kept: ${before.root} -> ${after}`)
+    assert.ok(after.startsWith(before.root),`existing ACEs kept in order: ${after}`)
+    const rights=ps(`(Get-Acl -LiteralPath '${quoted}').Access | ForEach-Object { $_.FileSystemRights.ToString() }`)
+    assert.match(rights,/TakeOwnership/)
+    assert.doesNotMatch(rights,/FullControl/)
+    assert.equal(sddl(deep),before.deep,'a deep file keeps its exact ACL')
+    assert.equal(sddl(deepDir),before.deepDir,'a deep directory keeps its exact ACL')
+    assert.equal(receipts(),initial+1,'one backup receipt per cold preparation')
+    await runPreparation(root)
+    assert.equal(receipts(),initial+1,'the warm path writes no new receipt')
+await test('ops reads and writes reach the host read-before-edit table (#17)', async () => {
+  await withTempDir('fs-observed',async root => {
+    fs.writeFileSync(path.join(root,'a.txt'),'alpha\nbeta\n')
+    const {ctx}=await bootHost()
+    const agent={id:'observed',session:{id:'observed',header:{cwd:root}}}
+    const exec={agent,signal:new AbortController().signal}
+    try {
+      await ctx.plugin(Subprocess)
+      await ctx.plugin(inner=>inner.provide('sandboxPolicy',{defaultMode:'danger-full-access',resolve:()=>({mode:'danger-full-access',workspaceRoot:root})}))
+      // Without the host fs service, ops tools still work and simply record nothing.
+      const bare=await fileCall(ctx,worker,'inspect_local_file',{path:'a.txt'},exec,exec.signal)
+      assert.equal(bare.status,'completed',JSON.stringify(bare))
+      await ctx.plugin(FileSystem,{})
+      await ctx.plugin(ObservationPolicy)
+      const host=ctx.get('fs')
+      const target=await host.resolve('a.txt',{cwd:root})
+      const intent=()=>ctx.waterfall('fs/edit-intent',target,exec,()=>undefined)
+      const current=async()=>(await host.stat(target)).version
+      await assert.rejects(intent(),error=>error.code==='FS_NOT_OBSERVED')
+      const read=await fileCall(ctx,worker,'inspect_local_file',{path:'a.txt',limit:1},exec,exec.signal)
+      assert.equal(read.status,'completed',JSON.stringify(read))
+      assert.deepEqual(await intent(),{version:await current()})
+      const before=await current()
+      const dry=await fileCall(ctx,worker,'replace',{path:'a.txt',pattern:'alpha',replacement:'gamma',dryRun:true},exec,exec.signal)
+      assert.equal(dry.dryRun,true,JSON.stringify(dry))
+      assert.deepEqual(await intent(),{version:before})
+      // Keep the size identical so the version change is not a size-only artifact.
+      await new Promise(r=>setTimeout(r,20))
+      const replaced=await fileCall(ctx,worker,'replace',{path:'a.txt',pattern:'alpha',replacement:'delta'},exec,exec.signal)
+      assert.equal(replaced.changed,1,JSON.stringify(replaced))
+      const after=await current()
+      assert.notEqual(after,before)
+      assert.deepEqual(await intent(),{version:after})
+    } finally { await shutdown(ctx) }
   })
 })
 await test('owned Modify-only workspace starts real DSH sandbox; three modes and explicit denials', async () => {
@@ -67,6 +174,15 @@ await test('owned Modify-only workspace starts real DSH sandbox; three modes and
       assert.equal(nodeHandle.collected.stdout.readFrom(0).text,'NODE_PTC_READY')
       const read=await fileCall(ctx,worker,'inspect_local_file',{path:path.join(outside,'keep.txt')},exec,exec.signal)
       assert.equal(read.status,'completed',JSON.stringify(read))
+      // Strict adapters fill optional fields with empty placeholders; they must not reach the worker. (#19)
+      const grep=await fileCall(ctx,worker,'grep',{path:'',pattern:'before',glob:[],outputMode:''},exec,exec.signal)
+      assert.equal(grep.status,'completed',JSON.stringify(grep))
+      assert.ok(grep.matched>=1,JSON.stringify(grep))
+      const placeholders=await fileCall(ctx,worker,'inspect_local_file',{path:path.join(outside,'keep.txt'),encoding:'',view:'',offset:null},exec,exec.signal)
+      assert.equal(placeholders.status,'completed',JSON.stringify(placeholders))
+      const badEncoding=await fileCall(ctx,worker,'inspect_local_file',{path:path.join(outside,'keep.txt'),encoding:'gbk'},exec,exec.signal)
+      assert.notEqual(badEncoding.status,'completed',JSON.stringify(badEncoding))
+      assert.equal(badEncoding.error.code,'INVALID_ARGUMENT',JSON.stringify(badEncoding))
       const replaced=await fileCall(ctx,worker,'replace',{path:'data.txt',pattern:'before',replacement:'after'},exec,exec.signal)
       assert.equal(replaced.changed,1,JSON.stringify(replaced))
       const batch=await ptcCall(ctx,worker,'batch',{root,action:'run',operations:[{op:'copy',path:'data.txt',to:'copy.txt'}]},exec,exec.signal)

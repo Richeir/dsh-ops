@@ -39,6 +39,7 @@ import {
   publishShellTools,
   resolveShells,
   shellUpstreamPin,
+  withBashStatus,
 } from '../lib/shells.js'
 import { assert, PACKAGE_ROOT, TEST_HOME, report, test, withTempDir } from './lib/harness.mjs'
 
@@ -884,6 +885,7 @@ await test('ops_bash runs the resolved bash as `bash -c <command>` through ctx.s
     // never carries a null, because the output schema declares single types.
     assert.deepEqual(value, {
       exitCode: 3,
+      status: 'failed',
       timedOut: false,
       timeoutMs: 5_000,
       stdout: { text: 'out\n', truncated: false },
@@ -906,6 +908,7 @@ await test('ops_bash reports a signal death with a signal and no exit code', asy
 
     assert.deepEqual(value, {
       signal: 'SIGTERM',
+      status: 'failed',
       timedOut: false,
       timeoutMs: DEFAULT_BASH_TIMEOUT_MS,
       stdout: { text: '', truncated: false },
@@ -913,6 +916,31 @@ await test('ops_bash reports a signal death with a signal and no exit code', asy
     })
     assert.equal(Object.hasOwn(value, 'exitCode'), false)
     assert.equal(definition.output.render({}, value)[0].text, '(no output)\n[signal: SIGTERM]')
+  })
+})
+
+await test('ops_bash results carry status: completed only for a clean zero exit (#44)', async () => {
+  await withTempDir('shells-status', async (dir) => {
+    const bash = makeExecutable(path.join(dir, 'bash'))
+    const run = async (outcome, args = { command: 'true' }) => {
+      const { service, settle } = fakeSubprocess(outcome)
+      const running = bashToolDefinition({ file: bash, source: 'config', subprocess: service }).execute(args, { signal: new AbortController().signal })
+      settle()
+      return running
+    }
+    assert.equal((await run({ exitCode: 0, stdout: 'ok' })).status, 'completed')
+    assert.equal((await run({ exitCode: 1 })).status, 'failed')
+    assert.equal((await run({ exitCode: null, signal: 'SIGKILL' })).status, 'failed')
+    const broken = { spawn() { throw Object.assign(new Error('gone'), { code: 'ENOENT' }) } }
+    const spawnError = await bashToolDefinition({ file: bash, source: 'config', subprocess: broken }).execute({ command: 'true' }, {})
+    assert.equal(spawnError.status, 'failed')
+    assert.match(spawnError.error, /ENOENT/)
+    // Stamping after a wrapper adds error/permission always yields failed.
+    assert.equal(withBashStatus({ exitCode: 0, timedOut: false, error: 'EXECUTOR_UNAVAILABLE' }).status, 'failed')
+    assert.equal(withBashStatus({ exitCode: 0, timedOut: false, permission: {} }).status, 'failed')
+    assert.equal(withBashStatus({ exitCode: 0, timedOut: true }).status, 'failed')
+    // Argument errors still throw, so the host reports them as a failed tool call.
+    await assert.rejects(() => run({ exitCode: 0 }, { command: 'true', bogus: 1 }), /unknown key "bogus"/)
   })
 })
 
@@ -1096,6 +1124,15 @@ await test('ops_bash refuses an argument its schema does not declare', async () 
     await assert.rejects(
       () => definition.execute({ command: 'ls', bogus: 1, other: 2 }, exec),
       /unknown keys "bogus", "other"/,
+    )
+    // Host-style per-call escalation is named as unsupported, with the real next step (#42).
+    await assert.rejects(
+      () => definition.execute({ command: 'ls', sandbox_permissions: 'danger-full-access', justification: 'x' }, exec),
+      /unknown keys "sandbox_permissions", "justification".*no per-call sandbox escalation; ask the user to change the session permission mode/,
+    )
+    await assert.rejects(
+      () => definition.execute({ command: 'ls', bogus: 1 }, exec),
+      (error) => !/sandbox escalation/.test(error.message),
     )
     // A non-object body is refused for the same reason, not coerced.
     await assert.rejects(() => definition.execute([], exec), /expected an object/)

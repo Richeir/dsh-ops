@@ -135,6 +135,7 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
     "@deepseek-ai/dsh-fs-local": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs-observation-policy": "0.2.0-rc.2",
     "@deepseek-ai/dsh-ptc-runtime-node": "0.2.0-rc.2",
     "@deepseek-ai/dsh-sandbox-local": "0.2.0-rc.2",
     "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
